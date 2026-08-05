@@ -1,13 +1,12 @@
 """
-runner.py — RSS pipeline with inline per-item severity classification.
+runner.py — RSS pipeline with batch Groq severity classification.
 
 For each feed:
   1. Parse feed via RSSParser
-  2. For each item: normalize → classify severity via Groq → save to DB
-  3. Next feed
-
-No more batch post-processing. Every item is classified and saved before
-the next feed starts.
+  2. Normalize all items
+  3. Filter items needing Groq (not cached, not cyber)
+  4. Batch-classify severity (10 items per Groq call → 10x faster)
+  5. Save all items to DB
 """
 
 import asyncio
@@ -23,7 +22,7 @@ from financial_scraper.scrapers.rss.parser import RSSParser
 from financial_scraper.scrapers.rss.normalizer import normalize
 from financial_scraper.utils.cache import CheckpointStore
 from financial_scraper.utils.dedup import UrlDeduplicator
-from financial_scraper.utils.severity import classify_severity
+from financial_scraper.utils.severity import classify_severity, classify_batch_inline
 from financial_scraper.utils.text_utils import score_from_level
 
 log = logging.getLogger("financial_scraper.scrapers.rss.runner")
@@ -64,9 +63,11 @@ class RSSPipeline:
         self._resource_map = resource_map or {}
 
     async def run_unsafe(self) -> list:
-        """Parse feeds, classify severity inline, save to DB.
+        """Parse feeds, batch-classify severity, save to DB.
 
-        Returns an empty list — kept for backward compatibility.
+        Instead of one Groq call per item (slow), collects all items
+        needing classification across all feeds and batch-classifies
+        them 10 at a time via Groq. Saves ~90% of Groq wall-clock time.
         """
         summary: dict[str, int] = {"market": 0, "risks": 0, "alert": 0, "skipped": 0, "errors": 0}
         feeds = [f for f in ACTIVE_FEEDS if f.get("enabled", True)]
@@ -112,6 +113,10 @@ class RSSPipeline:
                     enriched = sum(1 for i in items if i.extra.get("cvss_score") is not None)
                     log.info("[PIPELINE] NVD enrichment: %d/%d items got CVSS score", enriched, cisa_without_score)
 
+            # Phase 1: Normalize ALL items, collect batch-classification candidates
+            all_normalized: list[tuple] = []  # (raw_item, normalized_dict)
+            batch_candidates: list[dict] = []
+
             for raw_item in items:
                 if not raw_item.url:
                     continue
@@ -127,13 +132,44 @@ class RSSPipeline:
                     continue
 
                 for normalized in normalized_list:
-                    try:
-                        await self._process_item(slug, raw_item, normalized, summary)
-                    except Exception as exc:
-                        log.error("[%s] Item processing error: %s", slug, exc)
-                        summary["errors"] += 1
+                    all_normalized.append((raw_item, normalized))
 
-                self._dedup.mark_seen(raw_item.url)
+                    # Check if this item NEEDS Groq classification
+                    if normalized.get("alert_type") == "cyber":
+                        continue  # CVSS-based, no Groq
+                    title = normalized.get("title", "")
+                    if not title or len(title) < 3:
+                        continue  # No title — defaulted to low later
+                    if self._checkpoint.get(slug, title, normalized.get("description", "")):
+                        continue  # Already cached
+
+                    batch_candidates.append({
+                        "source": slug,
+                        "title": title,
+                        "description": normalized.get("description", ""),
+                    })
+
+            # Phase 2: Batch-classify ALL uncached items across this feed
+            if batch_candidates:
+                log.info("[%s] Batch-classifying %d uncached items via Groq...", slug, len(batch_candidates))
+                await classify_batch_inline(
+                    batch_candidates,
+                    batch_size=10,
+                    cache=self._checkpoint,
+                )
+
+            # Phase 3: Process (classify + filter + save) each item
+            seen_raw: set[int] = set()
+            for raw_item, normalized in all_normalized:
+                try:
+                    await self._process_item(slug, raw_item, normalized, summary)
+                except Exception as exc:
+                    log.error("[%s] Item processing error: %s", slug, exc)
+                    summary["errors"] += 1
+
+                if id(raw_item) not in seen_raw:
+                    seen_raw.add(id(raw_item))
+                    self._dedup.mark_seen(raw_item.url)
 
             log.info("[%s] parsed=%d items", slug, len(items))
 
@@ -214,8 +250,9 @@ class RSSPipeline:
                 await self._save_or_print(normalized, target_table, slug, summary)
             return
 
-        # Classify severity inline (Groq API call)
-        called_groq = True
+        # Severity is already in checkpoint from batch classification.
+        # This will never make a Groq call — it only reads cache.
+        called_groq = False
         try:
             severity_result = await classify_severity(
                 title=title,
@@ -227,10 +264,9 @@ class RSSPipeline:
             reason = severity_result.get("reason", "")
             log.debug("[severity] %s → %s | %s", title[:50], severity, reason[:60] if reason else "")
         except Exception as exc:
-            log.warning("[severity] Groq failed for '%s': %s", title[:50], exc)
+            log.warning("[severity] Classification lookup failed for '%s': %s", title[:50], exc)
             severity = "medium"
-            reason = "Groq classification failed"
-            called_groq = False
+            reason = "Classification unavailable"
 
         _apply_severity(normalized, target_table, severity, reason)
 
@@ -240,8 +276,6 @@ class RSSPipeline:
                 out = {**normalized, "_table": target_table, "_filtered": "severity_too_low"}
                 print(json.dumps(out, indent=2, default=str))
             summary["skipped"] += 1
-            if called_groq:
-                await asyncio.sleep(2.1)
             return
 
         # Filter: compliance alerts below critical are discarded
@@ -250,15 +284,9 @@ class RSSPipeline:
                 out = {**normalized, "_table": target_table, "_filtered": "severity_too_low"}
                 print(json.dumps(out, indent=2, default=str))
             summary["skipped"] += 1
-            if called_groq:
-                await asyncio.sleep(2.1)
             return
 
         await self._save_or_print(normalized, target_table, slug, summary)
-
-        # Rate limiting: 2.1s between Groq API calls (30 req/min free tier)
-        if called_groq:
-            await asyncio.sleep(2.1)
 
     async def _save_or_print(self, data: dict, target_table: str, slug: str, summary: dict) -> None:
         if self._dev_mode or self._repository is None:

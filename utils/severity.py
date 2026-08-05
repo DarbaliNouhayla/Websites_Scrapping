@@ -259,6 +259,145 @@ async def get_severity(
     )
 
 
+async def classify_batch_inline(
+    items: list[dict],
+    batch_size: int = 10,
+    cache: SeverityCacheProtocol | None = None,
+) -> list[dict]:
+    """One Groq call per batch_size items. Saves ~90% of API time vs per-item calls.
+
+    Each Groq call classifies up to batch_size articles at once.
+    Only ONE 2.1s rate-limit sleep per batch (vs per-item with classify_batch).
+
+    Args:
+        items: list of dicts, each with: source, title, description
+        batch_size: articles per Groq call (default 10)
+        cache: Optional cache — pre-checked to skip already-classified items
+
+    Returns:
+        list of {"severity": "...", "reason": "..."} in same order as input
+    """
+    total = len(items)
+    results: list[dict | None] = [None] * total
+    uncached_indices: list[int] = []
+
+    # 1. Check cache for all items first
+    cache_hits = 0
+    for i, item in enumerate(items):
+        source = item.get("source", "")
+        title = item.get("title", "")
+        description = item.get("description", "")
+        if cache is not None:
+            cached = cache.get(source, title, description)
+            if cached is not None:
+                results[i] = cached
+                cache_hits += 1
+                continue
+        uncached_indices.append(i)
+
+    if not uncached_indices:
+        log.info("[severity] classify_batch_inline: all %d cache hits, 0 API calls", total)
+        return [r for r in results if r is not None]
+
+    # 2. Batch-call Groq for uncached items
+    n_uncached = len(uncached_indices)
+    log.info("[severity] classify_batch_inline: %d/%d uncached, batch_size=%d", n_uncached, total, batch_size)
+
+    for start in range(0, n_uncached, batch_size):
+        batch_indices = uncached_indices[start:start + batch_size]
+        batch_items = [items[i] for i in batch_indices]
+
+        batch_input = [
+            {
+                "id": j,
+                "source": item.get("source", ""),
+                "title": item.get("title", "")[:150],
+                "description": item.get("description", "")[:100],
+            }
+            for j, item in enumerate(batch_items)
+        ]
+
+        try:
+            response = await _get_client().chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a risk analyst for Attijariwafa Bank, Morocco. "
+                            "Classify severity for each article in the JSON array. "
+                            "Return a JSON array with same number of objects in same order: "
+                            '[{"severity":"critical|high|medium|low","reason":"one sentence"}] '
+                            "Rules: critical=sanctions/suspension/active cyberattack/national strike, "
+                            "high=binding regulation/rate decision/major Morocco impact, "
+                            "medium=reports/statistics/consultations, "
+                            "low=appointments/partnerships/routine. "
+                            "Return ONLY the JSON array."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(batch_input, ensure_ascii=False),
+                    },
+                ],
+                max_tokens=batch_size * 50,
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+
+            raw = response.choices[0].message.content.strip()
+            parsed = json.loads(raw)
+
+            # Handle {"results": [...]} or direct [...]
+            if isinstance(parsed, dict):
+                parsed = next(
+                    (v for v in parsed.values() if isinstance(v, list)),
+                    []
+                )
+
+            if isinstance(parsed, list) and len(parsed) == len(batch_items):
+                for idx_in_batch, item_result in enumerate(parsed):
+                    sev = item_result.get("severity", "medium")
+                    if sev not in ("critical", "high", "medium", "low"):
+                        sev = "medium"
+                    actual_idx = batch_indices[idx_in_batch]
+                    result = {
+                        "severity": sev,
+                        "reason": item_result.get("reason", ""),
+                    }
+                    results[actual_idx] = result
+                    # Write to cache
+                    if cache is not None:
+                        item = items[actual_idx]
+                        cache.set(
+                            item.get("source", ""),
+                            item.get("title", ""),
+                            item.get("description", ""),
+                            result,
+                        )
+            else:
+                log.warning("[severity] Batch response mismatch: expected %d items, got %d",
+                           len(batch_items), len(parsed) if isinstance(parsed, list) else -1)
+                for idx_in_batch in range(len(batch_items)):
+                    results[batch_indices[idx_in_batch]] = dict(_FALLBACK)
+
+        except Exception as exc:
+            log.warning("[severity] Batch Groq call failed: %s", exc)
+            for idx_in_batch in range(len(batch_items)):
+                results[batch_indices[idx_in_batch]] = dict(_FALLBACK)
+
+        # ONE sleep per batch, not per item
+        is_last_batch = (start + batch_size >= n_uncached)
+        if not is_last_batch:
+            await asyncio.sleep(2.1)
+
+    log.info(
+        "[severity] Batch classified %d items (%d cache hits, %d API calls)",
+        total, cache_hits, (n_uncached + batch_size - 1) // batch_size,
+    )
+    return results
+
+
 async def classify_batch(
     items: list[dict],
     cache: SeverityCacheProtocol | None = None,
